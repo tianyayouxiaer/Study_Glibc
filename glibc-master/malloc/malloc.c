@@ -1455,6 +1455,19 @@ bit 记录了控制信息，需要屏蔽掉这些控制信息，取出实际的 
     But to conserve space and improve locality, we allocate
     only the fd/bk pointers of bins, and then use repositioning tricks
     to treat these as the fields of a malloc_chunk*.
+
+    对于空闲的 chunk， ptmalloc 采用分箱式内存管理方式，根据空闲 chunk 的大小和处于
+	的状态将其放在四个不同的 bin 中，这四个空闲 chunk 的容器包括 fast bins， unsorted bin，
+	small bins 和 large bins。 Fast bins 是小内存块的高速缓存，当一些大小小于 64 字节的 chunk
+	被回收时，首先会放入 fast bins 中，在分配小内存时，首先会查看 fast bins 中是否有合适的
+	内存块，如果存在，则直接返回 fast bins 中的内存块，以加快分配速度。 Usorted bin 只有一
+	个，回收的 chunk 块必须先放到 unsorted bin 中，分配内存时会查看 unsorted bin 中是否有
+	合适的 chunk，如果找到满足条件的 chunk，则直接返回给用户，否则将 unsorted bin 的所
+	有 chunk 放入 small bins 或是 large bins 中。 Small bins 用于存放固定大小的 chunk，共 64 个
+	bin，最小的 chunk 大小为 16 字节或 32 字节，每个 bin 的大小相差 8 字节或是 16 字节，当
+	分配小内存块时，采用精确匹配的方式从 small bins 中查找合适的 chunk。 Large bins 用于存
+	储大于等于 512B 或 1024B 的空闲 chunk，这些 chunk 使用双向链表的形式按大小顺序排序，
+	分配内存时按最近匹配方式从 large bins 中分配 chunk。
 */
 
 typedef struct malloc_chunk* mbinptr;
@@ -1799,18 +1812,24 @@ struct malloc_state {
 
 #ifdef PER_THREAD
   /* Linked list for free arenas.  */
+  // 空闲的分配区链接在单向链表中
   struct malloc_state *next_free;
 #endif
 
   /* Memory allocated from the system in this arena.  */
+  // 记录了当前分配区已经分配的内存大小
   INTERNAL_SIZE_T system_mem;
+  // 记录了当前分配区最大能分配的内存大小
   INTERNAL_SIZE_T max_system_mem;
 };
 
 struct malloc_par {
   /* Tunable parameters */
+  // 收缩阈值，默认为128KB
   unsigned long    trim_threshold;
+  // 分配内存时是否添加额外的pad，默认该字段为 0
   INTERNAL_SIZE_T  top_pad;
+  // mmap 分配阈值，默认值为 128KB
   INTERNAL_SIZE_T  mmap_threshold;
 #ifdef PER_THREAD
   INTERNAL_SIZE_T  arena_test;
@@ -1818,22 +1837,26 @@ struct malloc_par {
 #endif
 
   /* Memory map support */
-  int              n_mmaps;
-  int              n_mmaps_max;
-  int              max_n_mmaps;
+  int              n_mmaps;//     mmap()函数分配的内存块的个数
+  int              n_mmaps_max;// 进程使用 mmap()函数分配的内存块的最大数量，默认值为65536，可以使用 mallopt()函数修改
+  int              max_n_mmaps;// 当前进程使用 mmap()函数分配的内存块的数量的最大值
   /* the mmap_threshold is dynamic, until the user sets
      it manually, at which point we need to disable any
      dynamic behavior. */
   int              no_dyn_threshold;
 
   /* Statistics */
+  // mmapped_mem 和 max_mmapped_mem 都用于统计 mmap 分配的内存大小，一般情况两个字段的值相等，
+  // max_mmapped_mem 用于 mstats()函数。
   INTERNAL_SIZE_T  mmapped_mem;
   /*INTERNAL_SIZE_T  sbrked_mem;*/
   /*INTERNAL_SIZE_T  max_sbrked_mem;*/
   INTERNAL_SIZE_T  max_mmapped_mem;
+  // 在单线程情况下用于统计进程分配的内存总数
   INTERNAL_SIZE_T  max_total_mem; /* only kept for NO_THREADS */
 
   /* First address handed out by MORECORE/sbrk.  */
+  //堆的起始地址 
   char*            sbrk_base;
 };
 
@@ -1843,6 +1866,8 @@ struct malloc_par {
    before using. This malloc relies on the property that malloc_state
    is initialized to all zeroes (as is true of C statics).  */
 
+/* main_arena 表示主分配区，任何进程有且仅有一个全局的主分配区
+ */
 static struct malloc_state main_arena =
   {
     .mutex = MUTEX_INITIALIZER,
@@ -1850,7 +1875,7 @@ static struct malloc_state main_arena =
   };
 
 /* There is only one instance of the malloc parameters.  */
-
+// mp_是全局唯一的   一个 malloc_par 实例，用于管理参数和统计信息
 static struct malloc_par mp_ =
   {
     .top_pad        = DEFAULT_TOP_PAD,
@@ -1872,6 +1897,7 @@ static struct malloc_par mp_ =
 
 
 /* Maximum size of memory handled in fastbins.  */
+// global_max_fast 全局变量表示 fast bins 中 最大的 chunk 大小。
 static INTERNAL_SIZE_T global_max_fast;
 
 /*

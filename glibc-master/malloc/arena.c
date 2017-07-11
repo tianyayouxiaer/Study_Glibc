@@ -367,6 +367,9 @@ libc_hidden_proto (_dl_open_hook);
 static void
 ptmalloc_init (void)
 {
+	/* 首先检查全局变量__malloc_initialized 是否大于等于 0，如果该值大于 0，表示 ptmalloc
+	已经初始化，如果改值为 0，表示 ptmalloc 正在初始化，全局变量__malloc_initialized 用来
+	保证全局只初始化 ptmalloc 一次。*/
   if(__malloc_initialized >= 0) return;
   __malloc_initialized = 0;
 
