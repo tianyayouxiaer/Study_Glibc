@@ -321,6 +321,9 @@ __malloc_assert (const char *assertion, const char *file, unsigned int line,
   on some systems.
 */
 
+/*  Ptmalloc 使用宏来屏蔽不同平台的差异，将 INTERNAL_SIZE_T 定义为 size_t， SIZE_SZ
+	定义为 size_t 的大小，在 32 位平台下位 4 字节，在 64 位平台下位 4 字节或者 8 字节。
+*/
 #ifndef INTERNAL_SIZE_T
 #define INTERNAL_SIZE_T size_t
 #endif
@@ -348,6 +351,7 @@ __malloc_assert (const char *assertion, const char *file, unsigned int line,
    malloc_set_state than will returning blocks not adequately aligned for
    long double objects under -mlong-double-128.  */
 
+//分配 chunk 时必须以 2*SIZE_SZ 对齐
 #  define MALLOC_ALIGNMENT       (2 * SIZE_SZ < __alignof__ (long double) \
 				  ? __alignof__ (long double) : 2 * SIZE_SZ)
 # else
@@ -356,6 +360,7 @@ __malloc_assert (const char *assertion, const char *file, unsigned int line,
 #endif
 
 /* The corresponding bit mask value */
+// 32 平台	chunk 地址按 8 字节对齐， 64 位平台按 8 字节或是 16 字节对齐
 #define MALLOC_ALIGN_MASK      (MALLOC_ALIGNMENT - 1)
 
 
@@ -1120,21 +1125,40 @@ static void      free_atfork(void* mem, const void *caller);
   It declares a "view" into memory allowing access to necessary
   fields at known offsets from a given base. See explanation below.
 */
-
+// Ptmalloc 采用边界标记法将内存划分成很多块，从而对内存的分配与回收进行管理。
 struct malloc_chunk {
 
+  // 如果前一个 chunk 是空闲的，该域表示前一个 chunk 的大小;
+  // 如果前一个 chunk不空闲，该域无意义
   INTERNAL_SIZE_T      prev_size;  /* Size of previous chunk (if free).  */
+  // 当前 chunk 的大小，并且记录了当前 chunk 和前一个 chunk 的一些属性，
+  // 包括前一个 chunk 是否在使用中; 当前 chunk 是否是通过 mmap 获得的内存;当前 chunk 是否属于
+  // 非主分配区。
   INTERNAL_SIZE_T      size;       /* Size in bytes, including overhead. */
 
+  /* 指针 fd 和 bk 只有当该 chunk 块空闲时才存在
+  	 其作用是用于将对应的空闲	 chunk 块加入到空闲 chunk 块链表中统一管理,
+  	 如果该 chunk 块被分配给应用程序使用，
+  	 那 么这两个指针也就没有用（该 chunk 块已经从空闲链中拆出）了，所以也当作应用程序的使
+     用空间，而不至于浪费。
+  */
   struct malloc_chunk* fd;         /* double links -- used only if free. */
   struct malloc_chunk* bk;
 
   /* Only used for large blocks: pointer to next larger size.  */
+  /*
+    当前的 chunk 存在于 large bins 中时， large bins 中的空闲
+	chunk 是按照大小排序的，但同一个大小的 chunk 可能有多个， 增加了这两个字段可以加快
+	遍历空闲 chunk，并查找满足需要的空闲 chunk，
+	fd_nextsize 指向下一个比当前 chunk 大小	大的第一个空闲 chunk，
+	bk_nextszie 指向前一个比当前 chunk 大小小的第一个空闲 chunk。
+  */
   struct malloc_chunk* fd_nextsize; /* double links -- used only if free. */
   struct malloc_chunk* bk_nextsize;
 };
 
 
+//分配的 chunk 和空闲的 chunk 形式
 /*
    malloc_chunk details:
 
@@ -1227,15 +1251,18 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 */
 
 /* conversion from malloc headers to user pointers, and back */
-
+// 对于已经分配的 chunk，通过 chunk2mem 宏根据 chunk 地址获得返回给用户的内存地址
 #define chunk2mem(p)   ((void*)((char*)(p) + 2*SIZE_SZ))
+// 根据 mem 地址得到 chunk 地址
 #define mem2chunk(mem) ((mchunkptr)((char*)(mem) - 2*SIZE_SZ))
 
 /* The smallest possible chunk */
+// 最小的 chunk 的大小， 32 位平台上位 16 字节， 64 位平台为 24字节或是 32 字节
 #define MIN_CHUNK_SIZE        (offsetof(struct malloc_chunk, fd_nextsize))
 
 /* The smallest size we can malloc is an aligned minimal chunk */
-
+// MINSIZE 定义了最小的分配的内存大小，是对 MIN_CHUNK_SIZE 进行了
+// 2*SIZE_SZ 对齐，地址对齐后与 MIN_CHUNK_SIZE 的大小仍然是一样的。
 #define MINSIZE  \
   (unsigned long)(((MIN_CHUNK_SIZE+MALLOC_ALIGN_MASK) & ~MALLOC_ALIGN_MASK))
 
@@ -1253,7 +1280,7 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
    padded and aligned. To simplify some other code, the bound is made
    low enough so that adding MINSIZE will also not wrap around zero.
 */
-
+// 将用户请求的分配大小转换成内部需要分配的 chunk 大小
 #define REQUEST_OUT_OF_RANGE(req)                                 \
   ((unsigned long)(req) >=                                        \
    (unsigned long)(INTERNAL_SIZE_T)(-2 * MINSIZE))
@@ -1278,6 +1305,10 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   --------------- Physical chunk operations ---------------
 */
 
+// 第 0 位: 作为 P 状态位，标记前一 chunk 块是否在使用中，为 1 表示使用，为 0 表示空	闲。
+// 第 1 位: 作为 M 状态位，标记本 chunk 块是否是使用 mmap()直接从进程的 mmap 映射区域分配的
+//   		  为 1 表示是，为 0 表示否。
+// 第 2 位: 作为 A 状态位，标记本 chunk 是否属于非主分配区，为 1 表示是，为 0 表示否。
 
 /* size field is or'ed with PREV_INUSE when previous adjacent chunk in use */
 #define PREV_INUSE 0x1
@@ -1313,19 +1344,33 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #define SIZE_BITS (PREV_INUSE|IS_MMAPPED|NON_MAIN_ARENA)
 
 /* Get size, ignoring use bits */
+// 获得 chunk 的实际大小，需要屏蔽掉 size 中的控制信息
 #define chunksize(p)         ((p)->size & ~(SIZE_BITS))
 
-
 /* Ptr to next physical malloc_chunk. */
+/* 字段 size 记录了本 chunk 的大小， 无论下一个 chunk 是空闲状态或是被使用状态，都可
+以通过本 chunk 的地址加上本 chunk 的大小，得到下一个 chunk 的地址， 由于 size 的低 3 个
+bit 记录了控制信息，需要屏蔽掉这些控制信息，取出实际的 size 在进行计算下一个 chunk
+地址， 这是 next_chunk(p)的实现原理。*/
+
 #define next_chunk(p) ((mchunkptr)( ((char*)(p)) + ((p)->size & ~SIZE_BITS) ))
 
 /* Ptr to previous physical malloc_chunk */
+/* 
+  1、当前 chunk 指针获得前一个空闲 chunk 地址,
+  2、如果前一个邻接 chunk 块空闲，那么当前 chunk 块结构体内的 prev_size 字段记录的
+     是前一个邻接 chunk 块的大小。
+  3、如果前一个邻接 chunk 在使用中，则当前 chunk 的 prev_size 的空间被前一个 chunk
+   借用中，其中的值是前一个 chunk 的内存内容，对当前 chunk 没有任何意义。
+*/
 #define prev_chunk(p) ((mchunkptr)( ((char*)(p)) - ((p)->prev_size) ))
 
 /* Treat space at ptr + offset as a chunk */
+// p+s 的地址强制看作一个 chunk
 #define chunk_at_offset(p, s)  ((mchunkptr)(((char*)(p)) + (s)))
 
 /* extract p's inuse bit */
+//  check/set/clear 当前 chunk 使用标志位
 #define inuse(p)\
 ((((mchunkptr)(((char*)(p))+((p)->size & ~SIZE_BITS)))->size) & PREV_INUSE)
 
@@ -1347,16 +1392,19 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #define clear_inuse_bit_at_offset(p, s)\
  (((mchunkptr)(((char*)(p)) + (s)))->size &= ~(PREV_INUSE))
 
-
 /* Set size at head, without disturbing its use bit */
+// 设置当前 chunk p 的 size 域并保留 size 域的控制信息
 #define set_head_size(p, s)  ((p)->size = (((p)->size & SIZE_BITS) | (s)))
 
 /* Set size/use field */
+// 设置当前 chunk p 的 size 域并忽略已有的 size 域控制信息
 #define set_head(p, s)       ((p)->size = (s))
 
 /* Set size at footer (only when chunk is not in use) */
+// 设置当前 chunk p 的下一个 chunk 的 prev_size 为 s，s 为当前 chunk 的 size，只有当 chunk
+// p 为空闲时才能使用这个宏，当前 chunk 的 foot 的内存空间存在于下一个 chunk，即下一个
+// chunk 的 prev_size
 #define set_foot(p, s)       (((mchunkptr)((char*)(p) + (s)))->prev_size = (s))
-
 
 /*
   -------------------- Internal data structures --------------------
@@ -1686,29 +1734,64 @@ typedef struct malloc_chunk* mfastbinptr;
 
 struct malloc_state {
   /* Serialize access.  */
-  mutex_t mutex;
+  // Mutex 用于串行化访问分配区，当有多个线程访问同一个分配区时，第一个获得这个
+  // mutex 的线程将使用该分配区分配内存，分配完成后，释放该分配区的 mutex，以便其它线
+  // 程使用该分配区。
+  mutex_t mutex;//
 
   /* Flags (formerly in max_fast).  */
+  // Flags 记录了分配区的一些标志
+  // bit0 用于标识分配区是否包含至少一个 fast bin chunk
+  // bit1 用于标识分配区是否能返回连续的虚拟地址空间。
   int flags;
 
+  // Malloc_state 中声明了几个对锁的统计变量，默认没有定义 THREAD_STATS， 所以不会对
+  // 锁的争用情况做统计。
 #if THREAD_STATS
   /* Statistics for locking.  Only used if THREAD_STATS is defined.  */
   long stat_lock_direct, stat_lock_loop, stat_lock_wait;
 #endif
-
+	
   /* Fastbins */
+  // fastbinsY 拥有 10（ NFASTBINS）个元素的数组，用于存放每个 fast chunk 链表头指针，
+  // 所以 fast bins 最多包含 10 个 fast chunk 的单向链表。
   mfastbinptr      fastbinsY[NFASTBINS];
 
   /* Base of the topmost chunk -- not otherwise kept in a bin */
+  // top 是一个 chunk 指针，指向分配区的 top chunk。
   mchunkptr        top;
 
   /* The remainder from the most recent split of a small request */
+  // last_remainder 是一个 chunk 指针，分配区上次分配 small chunk 时，从一个 chunk 中分
+  // 裂出一个 small chunk 返回给用户， 分裂后的剩余部分形成一个 chunk， last_remainder 就是
+  // 指向的这个 chunk。
   mchunkptr        last_remainder;
 
   /* Normal bins packed as described above */
+  /* bins 用于存储 unstored bin， small bins 和 large bins 的 chunk 链表头， small bins 一共 62
+	个， large bins 一共 63 个，加起来一共 125 个 bin。而 NBINS 定义为 128，其实 bin[0]和 bin[127]
+	都不存在， bin[1]为 unsorted bin 的 chunk 链表头，所以实际只有 126bins。 Bins 数组能存放
+	了 254（ NBINS*2 – 2）个 mchunkptr 指针， 而我们实现需要存储 chunk 的实例，一般情况下，
+	chunk 实例的大小为 6 个 mchunkptr 大小，这 254 个指针的大小怎么能存下 126 个 chunk 呢？
+	这里使用了一个技巧，如果按照我们的常规想法，也许会申请 126 个 malloc_chunk 结构体
+	指针元素的数组，然后再给链表申请一个头节点（即 126 个），再让每个指针元素正确指向
+	而形成 126 个具有头节点的链表。事实上，对于 malloc_chunk 类型的链表“头节点”，其内
+	的 prev_size 和 size 字段是没有任何实际作用的，fd_nextsize 和 bk_nextsize 字段只有 large bins
+	中的空闲 chunk 才会用到，而对于 large bins 的空闲 chunk 链表头不需要这两个字段，因此
+	这四个字段所占空间如果不合理使用的话那就是白白的浪费。我们再来看一看 128 个
+	malloc_chunk 结构体指针元素的数组占了多少内存空间呢？ 假设 SIZE_SZ 的大小为 8B，则指
+	针的大小也为 8B，结果为 126*2*8=2016 字节。而 126 个 malloc_chunk 类型的链表“头节点”
+	需要多少内存呢？ 126*6*8=6048，真的是 6048B 么？不是，刚才不是说了， prev_size， size，
+	fd_nextsize 和 bk_nextsize 这四个字段是没有任何实际作用的，因此完全可以被重用（覆盖），
+	47	因此实际需要内存为 126*2*8=2016。 Bins 指针数组的大小为，（ 128*2-2） *8=2032,2032 大
+	于 2016（事实上最后 16 个字节都被浪费掉了），那么这 254 个 malloc_chunk 结构体指针元
+	素数组所占内存空间就可以存储这 126 个头节点了。
+  */
   mchunkptr        bins[NBINS * 2 - 2];
 
   /* Bitmap of bins */
+  // binmap 字段是一个 int 数组， ptmalloc 用一个 bit 来标识该 bit 对应的 bin 中是否包含空
+  // 闲 chunk
   unsigned int     binmap[BINMAPSIZE];
 
   /* Linked list */
@@ -2842,7 +2925,7 @@ mremap_chunk(mchunkptr p, size_t new_size)
 void*
 __libc_malloc(size_t bytes)
 {
-  mstate ar_ptr;
+  mstate ar_ptr; // 这个就是分配区的结构体描述，每个线程都会有一个分配区(如果它要分配动态内存的话)
   void *victim;
 
   __malloc_ptr_t (*hook) (size_t, const __malloc_ptr_t)
@@ -5177,10 +5260,17 @@ malloc_info (int options, FILE *fp)
   return 0;
 }
 
-
+// strong_alias/weak_alias 强弱别名
+// 没有strong symbol的时候，链接器将fun链接到了weak symbol上，当我们增加实现了fun函数后，链接器就链接了strong symbol。
+// 这个是编译链接的时候进行的操作，类似于对象默认方法，当没有自定义的方法时，
+// 链接到默认的方法实现，如果有实现方法（Strong Alias）的时候就采用强别名。
+// 优点：默认方法不用关心，只要关心需要实现的方法。
+// 缺点：默认实现方法被隐藏（如果不注意的话），更像高级应用，只开发自己关心的内容，其他都由框架完成。
 strong_alias (__libc_calloc, __calloc) weak_alias (__libc_calloc, calloc)
 strong_alias (__libc_free, __cfree) weak_alias (__libc_free, cfree)
 strong_alias (__libc_free, __free) strong_alias (__libc_free, free)
+
+// trong_alias是GNU C中的定义，编译器判定这里malloc是__libc_malloc的别名
 strong_alias (__libc_malloc, __malloc) strong_alias (__libc_malloc, malloc)
 strong_alias (__libc_memalign, __memalign)
 weak_alias (__libc_memalign, memalign)
