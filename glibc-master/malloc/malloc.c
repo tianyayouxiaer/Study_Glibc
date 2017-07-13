@@ -1473,18 +1473,38 @@ bit 记录了控制信息，需要屏蔽掉这些控制信息，取出实际的 
 typedef struct malloc_chunk* mbinptr;
 
 /* addressing -- note that bin_at(0) does not exist */
+/* 通过 bin index 获得 bin 的链表头, chunk 中的 fb 和 bk 用于将空闲 chunk
+链入链表中，而对于每个 bin 的链表头，只需要这两个域就可以了， prev_size 和 size 对链表
+都来说都没有意义，浪费空间， ptmalloc 为了节约这点内存空间，增大 cpu 高速缓存的命中
+率，在 bins 数组中只为每个 bin 预留了两个指针的内存空间用于存放 bin 的链表头的 fb 和
+bk 指针。
+从 bin_at(m, i)的定义可以看出， bin[0]不存在，以 SIZE_SZ 为 4B 的平台为例， bin[1]的前
+4B 存储的是指针 fb，后 4B 存储的是指针 bk，而 bin_at 返回的是 malloc_chunk 的指针，由
+于 fb 在 malloc_chunk 的偏移地址为 offsetof (struct malloc_chunk, fd))=8，所以用 fb 的地址减
+去 8 就得到 malloc_chunk 的地址。但切记，对 bin 的链表头的 chunk，一定不能修改 prev_size
+和 size 域，这两个域是与其他 bin 的链表头的 fb 和 bk 内存复用的。
+*/
 #define bin_at(m, i) \
   (mbinptr) (((char *) &((m)->bins[((i) - 1) * 2]))			      \
 	     - offsetof (struct malloc_chunk, fd))
 
 /* analog of ++bin */
+/* 获得下一个 bin 的地址，根据前面的分析，我们知道只需要将当前 bin
+的地址向后移动两个指针的长度就得到下一个 bin 的链表头地址*/
 #define next_bin(b)  ((mbinptr)((char*)(b) + (sizeof(mchunkptr)<<1)))
 
 /* Reminders about list directionality within bins */
+/* 每个 bin 使用双向循环链表管理空闲 chunk， bin 的链表头的指针 fb 指向第一个可用的
+chunk，指针 bk 指向最后一个可用的 chunk。宏 first(b)用于获得 bin 的第一个可用 chunk，
+宏 last(b)用于获得 bin 的最后一个可用的 chunk，这两个宏便于遍历 bin，而跳过 bin 的链表
+头。*/
 #define first(b)     ((b)->fd)
 #define last(b)      ((b)->bk)
 
 /* Take a chunk off a bin list */
+/* 将 chunk 从所在的空闲链表中取出来， 注意 large bins 中的空闲
+chunk 可能处于两个双向循环链表中， unlink 时需要从两个链表中都删除
+*/
 #define unlink(P, BK, FD) {                                            \
   FD = P->fd;                                                          \
   BK = P->bk;                                                          \
@@ -1538,12 +1558,17 @@ typedef struct malloc_chunk* mbinptr;
     a valid chunk size the small bins are bumped up one.
 */
 
-#define NBINS             128
-#define NSMALLBINS         64
+/* 对于 SIZE_SZ 为 4B 的平台， bin[0]和 bin[1]是不存在的，因为最小的 chunk 为 16B， small
+bins 一共 62 个， large bins 一共 63 个，加起来一共 125 个 bin。而 NBINS 定义为 128，其实
+bin[0]和 bin[127]都不存在， bin[1]为 unsorted bin 的 chunk 链表头。*/
+#define NBINS             128 
+#define NSMALLBINS         64 //small bin个数
 #define SMALLBIN_WIDTH    MALLOC_ALIGNMENT
 #define SMALLBIN_CORRECTION (MALLOC_ALIGNMENT > 2 * SIZE_SZ)
 #define MIN_LARGE_SIZE    ((NSMALLBINS - SMALLBIN_CORRECTION) * SMALLBIN_WIDTH)
 
+/* 如果 SIZE_SZ 为 4B，则将 sz 除以 8，如果 SIZE_SZ 为 8B，则将 sz 除以 16，
+也就是除以 small bins 中等差数列的公差。*/
 #define in_smallbin_range(sz)  \
   ((unsigned long)(sz) < (unsigned long)MIN_LARGE_SIZE)
 
@@ -1583,6 +1608,9 @@ typedef struct malloc_chunk* mbinptr;
    : MALLOC_ALIGNMENT == 16 ? largebin_index_32_big (sz)                     \
    : largebin_index_32 (sz))
 
+/* 根据所需内存大小计算出所需 bin 的 index，如果所需内存大小属于 small
+	bins 的大小范围，调用 smallbin_index(sz)，否则调用 largebin_index(sz))
+*/
 #define bin_index(sz) \
  ((in_smallbin_range(sz)) ? smallbin_index(sz) : largebin_index(sz))
 
@@ -1599,6 +1627,13 @@ typedef struct malloc_chunk* mbinptr;
 
     The NON_MAIN_ARENA flag is never set for unsorted chunks, so it
     does not have to be taken into account in size comparisons.
+*/
+/* 
+Unsorted bin 可以看作是 small bins 和 large bins 的 cache，只有一个 unsorted bin，以双
+向链表管理空闲 chunk，空闲 chunk 不排序，所有的 chunk 在回收时都要先放到 unsorted bin
+中，分配时，如果在 unsorted bin 中没有合适的 chunk，就会把 unsorted bin 中的所有 chunk
+分别加入到所属的 bin 中，然后再在 bin 中分配合适的 chunk。 Bins 数组中的元素 bin[1]用于
+存储 unsorted bin 的 chunk 链表头。
 */
 
 /* The otherwise unindexable 1-bin is used to hold unsorted chunks. */
@@ -1623,6 +1658,11 @@ typedef struct malloc_chunk* mbinptr;
 */
 
 /* Conveniently, the unsorted bin can be used as dummy top on first call */
+/* 把 bin[1]设置为 unsorted bin 的 chunk 链表头，对 top chunk
+的初始化，也暂时把 top chunk 初始化为 unsort chunk，仅仅是初始化一个值而已，这个 chunk
+的内容肯定不能用于 top chunk 来分配内存，主要原因是 top chunk 不属于任何 bin，但
+ptmalloc 中的一些 check 代码，可能需要 top chunk 属于一个合法的 bin。
+*/
 #define initial_top(M)              (unsorted_chunks(M))
 
 /*
@@ -1665,10 +1705,21 @@ typedef struct malloc_chunk* mbinptr;
     other free chunks.
 */
 
+/*
+Fast bins主要是用于提高小内存的分配效率，默认情况下，对于 SIZE_SZ为4B的平台，
+小于64B 的chunk 分配请求对于SIZE_SZ为8B 的平台，小于128B的chunk 分配请求，首
+先会查找 fast bins中是否有所需大小的chunk存在精确匹配），如果存在，就直接返回。
+
+*/
+
 typedef struct malloc_chunk* mfastbinptr;
+// 根据 fast bin 的 index，获得 fast bin 的地址。 Fast bins 的数字定义在 malloc_state 中
 #define fastbin(ar_ptr, idx) ((ar_ptr)->fastbinsY[idx])
 
 /* offset 2 to use otherwise unindexable first 2 bins */
+/* 获得 fast bin 在 fast bins 数组中的 index，由于 bin[0]和 bin[1]中
+的 chunk不存在，所以需要减 2，对于 SIZE_SZ为 4B的平台，将 sz除以 8减 2得到 fast bin index，
+对于 SIZE_SZ 为 8B 的平台，将 sz 除以 16 减去 2 得到 fast bin index。 */
 #define fastbin_index(sz) \
   ((((unsigned int)(sz)) >> (SIZE_SZ == 8 ? 4 : 3)) - 2)
 
@@ -1688,7 +1739,13 @@ typedef struct malloc_chunk* mfastbinptr;
   consolidation reduces fragmentation surrounding large chunks even
   if trimming is not used.
 */
+/*
+根据 SIZE_SZ 的不同大小， 定义 MAX_FAST_SIZE 为 80B 或是 160B， fast bins 数组的大小
+NFASTBINS 为 10， FASTBIN_CONSOLIDATION_THRESHOLD 为 64k，当每次释放的 chunk 与该
+chunk 相邻的空闲 chunk 合并后的大小大于 64k 时，就认为内存碎片可能比较多了，就需要
+把 fast bins 中的所有 chunk 都进行合并，以减少内存碎片对系统的影响。
 
+*/
 #define FASTBIN_CONSOLIDATION_THRESHOLD  (65536UL)
 
 /*
@@ -1876,6 +1933,7 @@ static struct malloc_state main_arena =
 
 /* There is only one instance of the malloc parameters.  */
 // mp_是全局唯一的   一个 malloc_par 实例，用于管理参数和统计信息
+// 参数初始化
 static struct malloc_par mp_ =
   {
     .top_pad        = DEFAULT_TOP_PAD,
@@ -1909,13 +1967,14 @@ static INTERNAL_SIZE_T global_max_fast;
   to inline it at all call points, which turns out not to be an
   optimization at all. (Inlining it in malloc_consolidate is fine though.)
 */
-
+// 初始化分配区
 static void malloc_init_state(mstate av)
 {
   int     i;
   mbinptr bin;
 
   /* Establish circular links for normal bins */
+  // 遍历所有的 bins，初始化每个 bin 的空闲链表为空，即将 bin 的 fb 和 bk 都指向 bin 本身。
   for (i = 1; i < NBINS; ++i) {
     bin = bin_at(av,i);
     bin->fd = bin->bk = bin;
@@ -1924,11 +1983,15 @@ static void malloc_init_state(mstate av)
 #if MORECORE_CONTIGUOUS
   if (av != &main_arena)
 #endif
+	//只有主分配区才能分配连续的虚拟地址空间，所以对于非主分配区，需要设置为分配非连续虚拟地址空间。
     set_noncontiguous(av);
+    //如果初始化的是主分配区，需要设置 fast bins 中最大chunk 大小，
+    //由于主分配区只有一个，并且一定是最先初始化，这就保证了对全局变量
+	//global_max_fast 只初始化了一次，只要该全局变量的值非 0，也就意味着主分配区初始化了。
   if (av == &main_arena)
     set_max_fast(DEFAULT_MXFAST);
   av->flags |= FASTCHUNKS_BIT;
-
+  // 初始化top chunk
   av->top            = initial_top(av);
 }
 
@@ -4828,17 +4891,22 @@ __malloc_stats()
   ------------------------------ mallopt ------------------------------
 */
 
+// 配置选项
 int __libc_mallopt(int param_number, int value)
 {
   mstate av = &main_arena;
   int res = 1;
 
+  // 检测主分配区是否被初始化了，如果没有被初始化，则调用ptmalloc_init初始化ptmalloc
   if(__malloc_initialized < 0)
     ptmalloc_init ();
+   // 获得主分配区的锁
   (void)mutex_lock(&av->mutex);
   /* Ensure initialization/consolidation */
+  // 判断主分配区是否已经初始化，如果没有，则初始化主分配区。
   malloc_consolidate(av);
 
+  // mp_都没有锁，对 mp_中参数字段的修改，是通过主分配区的锁来同步的
   switch(param_number) {
   case M_MXFAST:
     if (value >= 0 && value <= MAX_FAST_SIZE) {

@@ -364,6 +364,7 @@ extern struct dl_open_hook *_dl_open_hook;
 libc_hidden_proto (_dl_open_hook);
 #endif
 
+
 static void
 ptmalloc_init (void)
 {
@@ -385,10 +386,20 @@ ptmalloc_init (void)
     __morecore = __failing_morecore;
 #endif
 
+  /* 创建线程私有实例arena_key，该私有实例保存的是分配区（arena）的malloc_state实例指针。
+  arena_key指向的可能是主分配区的指针，也可能是非主分配区的指针，这里将调用ptmalloc_init()
+  的线程的arena_key绑定到主分配区上。意味着本线程首选从主分配区分配内存。arena_key在glibc
+  中是一个线程私有变量*/
   tsd_key_create(&arena_key, NULL);
+  /* 就是__libc_tsd_MALLOC = &main_arena,
+  thread_atfork用来设置进程在fork创建子进程时关于锁设置的各个函数，
+  ptmalloc_lock_all和ptmalloc_unlock_all用来给父进程加锁解锁，ptmalloc_unlock_all2用来给子进程调用以解锁。*/
   tsd_setspecific(arena_key, (void *)&main_arena);
   thread_atfork(ptmalloc_lock_all, ptmalloc_unlock_all, ptmalloc_unlock_all2);
   const char *s = NULL;
+
+  //_environ就是__environ，里面保存了环境变量,  
+  //根据各个环境变量调用__libc_mallopt进行设置
   if (__builtin_expect (_environ != NULL, 1))
     {
       char **runp = _environ;
@@ -459,9 +470,12 @@ ptmalloc_init (void)
     if (check_action != 0)
       __malloc_check_init();
   }
+  
   void (*hook) (void) = force_reg (__malloc_initialize_hook);
   if (hook != NULL)
     (*hook)();
+
+  //最后将全局变量__malloc_initialized 设置为 1，表示 ptmalloc_init()已经初始化完成。
   __malloc_initialized = 1;
 }
 

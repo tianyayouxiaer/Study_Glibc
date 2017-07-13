@@ -38,6 +38,9 @@ extern void *__dso_handle __attribute__ ((__weak__));
 
 #include <fork.h>
 
+/* atfork_mem是一个全局的fork时的函数子针结构体fork_handler
+   __linkin_atfork就是将fork_handler原子添加进全局链表__fork_handlers中
+   __linkin_atfork用于将刚刚构造的fork_handler添加进全局链表__fork_handlers中而不用加锁，其实就是一个CAS锁*/
 #define ATFORK_MEM static struct fork_handler atfork_mem
 
 #ifdef SHARED
